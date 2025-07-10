@@ -13,8 +13,10 @@ def run_command(command, check=True, capture_output=False, input_text=None):
         )
         return result.stdout.strip() if capture_output else None
     except subprocess.CalledProcessError as e:
-        print(f"❌ Command failed: {e}")
-        sys.exit(1)
+        if check:
+            # Raise error instead of exiting, so caller can handle fallback
+            raise e
+        return None
 
 def generate_ssh_key(private_key):
     print("🔧 Generating SSH key...")
@@ -23,27 +25,39 @@ def generate_ssh_key(private_key):
     run_command(f'ssh-keygen -t rsa -b 4096 -f "{private_key}" -N ""')
 
 def check_key_auth(remote_user, remote_host):
+    print("🔍 Checking key-based auth...")
+    standard_opts = "-o BatchMode=yes -o ConnectTimeout=5 -o PasswordAuthentication=no"
+    legacy_opts = "-o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa"
+
     try:
-        run_command(
-            f'ssh -o BatchMode=yes -o ConnectTimeout=5 -o PasswordAuthentication=no {remote_user}@{remote_host} "echo success"',
-            check=True
-        )
+        run_command(f'ssh {standard_opts} {remote_user}@{remote_host} "echo success"', check=True)
         return True
     except subprocess.CalledProcessError:
-        return False
+        print("⚠️ Modern key negotiation failed. Trying legacy ssh-rsa compatibility...")
+        try:
+            run_command(f'ssh {legacy_opts} {standard_opts} {remote_user}@{remote_host} "echo success"', check=True)
+            print("⚠️ Connected using legacy ssh-rsa. Consider upgrading the remote server's SSH configuration.")
+            return True
+        except subprocess.CalledProcessError:
+            return False
 
 def push_key(remote_user, remote_host, public_key):
     print("📤 Pushing public key to remote host...")
+    pubkey_content = public_key.read_text().strip()
+
+    # Use legacy ssh-rsa options in push command
+    ssh_cmd = (
+        "ssh -o HostKeyAlgorithms=+ssh-rsa "
+        "-o PubkeyAcceptedAlgorithms=+ssh-rsa "
+        f"{remote_user}@{remote_host} "
+        f"\"mkdir -p ~/.ssh && echo '{pubkey_content}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys\""
+    )
+
     if shutil.which("ssh-copy-id"):
         run_command(f'ssh-copy-id {remote_user}@{remote_host}')
     else:
         print("🪛 ssh-copy-id not available, using manual method...")
-        pubkey_content = public_key.read_text().strip()
-        cmd = (
-            f'ssh {remote_user}@{remote_host} '
-            f'"mkdir -p ~/.ssh && echo \'{pubkey_content}\' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"'
-        )
-        run_command(cmd)
+        run_command(ssh_cmd)
 
 def copy_path_to_clipboard(path):
     path_str = str(path)
@@ -78,13 +92,13 @@ def main():
 
     # Check if key-based auth works
     if check_key_auth(remote_user, remote_host):
-        print("✅ Key-based auth already working.")
+        print("✅ Key-based auth is working.")
     else:
         push_key(remote_user, remote_host, public_key)
         if check_key_auth(remote_user, remote_host):
             print("🔐 Key installed successfully.")
         else:
-            print("⚠️ Still can't connect with key auth.")
+            print("❌ Still can't connect with key auth.")
 
     # Copy private key path to clipboard
     copy_path_to_clipboard(private_key)
